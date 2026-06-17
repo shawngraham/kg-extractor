@@ -1,0 +1,5 @@
+{
+  "name": "Archeological Graph Extractor",
+  "description": "Extracts a knowledge graph from archaeological texts according to a schema through a 4-pass extraction pipeline.",
+  "requestFramePermissions": [],
+}
