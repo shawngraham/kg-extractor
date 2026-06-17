@@ -31,7 +31,16 @@ const clearScreen = () => process.stdout.write("\x1b[2J\x1b[H");
 
 const DEFAULT_SAMPLE_TEXT = `Giacomo Medici is an Italian antiquities dealer who was convicted in 2005 of receiving stolen goods. Medici started dealing in antiquities in Rome during the 1960s. In July 1967, he was convicted in Italy of receiving looted artefacts, though in the same year he met and became an important supplier of antiquities to US dealer Robert Hecht. In 1968, Medici opened the gallery Antiquaria Romana in Rome and began to explore business opportunities in Switzerland. It is widely believed that in December 1971 he bought the illegally-excavated Euphronios (Sarpedon) krater from tombaroli before transporting it to Switzerland and selling it to Hecht.`;
 
-// Local State
+// Workspace persistence settings
+const WORKSPACE_DIR = path.join(process.cwd(), "tui_workspace");
+const STAGE_FILENAMES = {
+  p1: "stage1_reify.md",
+  p2: "stage2_seeds.md",
+  p3: "stage3_audits.md",
+  p4: "stage4_consolidated.md"
+};
+
+// Application State
 let inputText = DEFAULT_SAMPLE_TEXT;
 const stageOutputs = {
   p1: "",
@@ -41,7 +50,98 @@ const stageOutputs = {
 };
 
 /**
- * Direct LLM querying matching server.ts configuration
+ * Ensures the workspace directory exists on disk
+ */
+function ensureWorkspaceDir() {
+  if (!fs.existsSync(WORKSPACE_DIR)) {
+    fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+  }
+}
+
+/**
+ * Saves current input text to the workspace
+ */
+function saveWorkspaceInput() {
+  ensureWorkspaceDir();
+  fs.writeFileSync(path.join(WORKSPACE_DIR, "input.txt"), inputText, "utf-8");
+}
+
+/**
+ * Writes an individual stage output to disk for audit
+ */
+function saveWorkspaceStage(stage: "p1" | "p2" | "p3" | "p4") {
+  ensureWorkspaceDir();
+  const filePath = path.join(WORKSPACE_DIR, STAGE_FILENAMES[stage]);
+  fs.writeFileSync(filePath, stageOutputs[stage], "utf-8");
+
+  // If Stage 4 is saved, automatically export a synchronized CSV
+  if (stage === "p4") {
+    if (stageOutputs.p4) {
+      try {
+        const csvContent = translateToCSV(stageOutputs.p4);
+        fs.writeFileSync(path.join(WORKSPACE_DIR, "stage4_triples.csv"), csvContent, "utf-8");
+      } catch (e) {
+        // Suppress background CSV generation errors
+      }
+    } else {
+      const csvPath = path.join(WORKSPACE_DIR, "stage4_triples.csv");
+      if (fs.existsSync(csvPath)) fs.unlinkSync(csvPath);
+    }
+  }
+}
+
+/**
+ * Loads existing files from the tui_workspace directory if they exist
+ */
+function loadWorkspace() {
+  ensureWorkspaceDir();
+  const inputPath = path.join(WORKSPACE_DIR, "input.txt");
+  
+  if (fs.existsSync(inputPath)) {
+    inputText = fs.readFileSync(inputPath, "utf-8");
+  } else {
+    inputText = DEFAULT_SAMPLE_TEXT;
+    saveWorkspaceInput();
+  }
+
+  for (const [stage, filename] of Object.entries(STAGE_FILENAMES) as ["p1" | "p2" | "p3" | "p4", string][]) {
+    const stagePath = path.join(WORKSPACE_DIR, filename);
+    if (fs.existsSync(stagePath)) {
+      stageOutputs[stage] = fs.readFileSync(stagePath, "utf-8");
+    } else {
+      stageOutputs[stage] = "";
+    }
+  }
+}
+
+/**
+ * Reinitializes the workspace and clears files from disk
+ */
+function resetWorkspace() {
+  ensureWorkspaceDir();
+  inputText = DEFAULT_SAMPLE_TEXT;
+  saveWorkspaceInput();
+
+  for (const filename of Object.values(STAGE_FILENAMES)) {
+    const filePath = path.join(WORKSPACE_DIR, filename);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  }
+
+  const csvPath = path.join(WORKSPACE_DIR, "stage4_triples.csv");
+  if (fs.existsSync(csvPath)) {
+    fs.unlinkSync(csvPath);
+  }
+
+  stageOutputs.p1 = "";
+  stageOutputs.p2 = "";
+  stageOutputs.p3 = "";
+  stageOutputs.p4 = "";
+}
+
+/**
+ * Direct LLM querying logic matching server configurations
  */
 async function queryLLM(systemPrompt: string, userPrompt: string): Promise<string> {
   const host = (process.env.LOCAL_API_HOST || "https://rcsllm.carleton.ca/rcsapi").replace(/\/$/, "");
@@ -89,7 +189,7 @@ async function queryLLM(systemPrompt: string, userPrompt: string): Promise<strin
 }
 
 /**
- * Incorporate optional corrective guidance or continuing data logic
+ * Appends corrective guidance parameters or legacy outputs
  */
 function applyGuidance(prompt: string, previousOutput?: string, guidance?: string): string {
   if (!guidance && !previousOutput) return prompt;
@@ -105,7 +205,7 @@ function applyGuidance(prompt: string, previousOutput?: string, guidance?: strin
 }
 
 /**
- * Converts table structures to clean CSV formatting
+ * Translates tabular outputs into CSV columns
  */
 function translateToCSV(markdownText: string): string {
   const lines = markdownText.split("\n");
@@ -136,6 +236,9 @@ function translateToCSV(markdownText: string): string {
         let escaped = cell.replace(/"/g, '""');
         if (escaped.includes(",") || escaped.includes('"') || escaped.includes("\n")) {
           escaped = `"${escaped}"`;
+          if (escaped.startsWith('""') && escaped.endsWith('""') && escaped.length > 2) {
+             escaped = `"${escaped.slice(2, -2)}"`;
+          }
         }
         return escaped;
       }).join(",")
@@ -144,28 +247,31 @@ function translateToCSV(markdownText: string): string {
 }
 
 async function main() {
+  // Synchronize on-disk workspace with runtime memory at boot
+  loadWorkspace();
+
   const rl = readline.createInterface({ input, output });
 
   while (true) {
     clearScreen();
     console.log(`${cl.bold}${cl.cyan}========================================================================${cl.reset}`);
-    console.log(`  ${cl.bold}Chronos TUI - Stage-by-Stage Knowledge Graph Workshop${cl.reset}`);
+    console.log(`  ${cl.bold}Chronos TUI - Persistent Stage-by-Stage Workspace [Disk-Backed]${cl.reset}`);
     console.log(`${cl.bold}${cl.cyan}========================================================================${cl.reset}`);
     console.log(`  [1] View / Edit Active Source Literature`);
     console.log(`  [2] Run Autopilot Pipeline (Stages P1 -> P4 Sequentially)`);
     console.log(`  [3] Run Step-by-Step Interactive Workbench`);
-    console.log(`  [4] Export & Save Latest Results (Markdown / CSV)`);
-    console.log(`  [5] Reset Active Workspace`);
+    console.log(`  [4] Inspect Workspace Audit Folder (${cl.dim}./tui_workspace/${cl.reset})`);
+    console.log(`  [5] Reset Active Workspace (Deletes Stage Files)`);
     console.log(`  [0] Exit`);
     console.log(`${cl.cyan}------------------------------------------------------------------------${cl.reset}`);
     
     // Status Panel
-    console.log(`  ${cl.bold}Current Status:${cl.reset}`);
+    console.log(`  ${cl.bold}Workspace State:${cl.reset}`);
     console.log(`  - Source Text:  ${inputText ? `${inputText.substring(0, 50)}... (${inputText.length} chars)` : `${cl.red}Empty${cl.reset}`}`);
-    console.log(`  - Pass 1 (Reify):     ${stageOutputs.p1 ? `${cl.green}Ready${cl.reset}` : `${cl.dim}Empty${cl.reset}`}`);
-    console.log(`  - Pass 2 (Seeds):     ${stageOutputs.p2 ? `${cl.green}Ready${cl.reset}` : `${cl.dim}Empty${cl.reset}`}`);
-    console.log(`  - Pass 3 (Audits):    ${stageOutputs.p3 ? `${cl.green}Ready${cl.reset}` : `${cl.dim}Empty${cl.reset}`}`);
-    console.log(`  - Pass 4 (Consolid):  ${stageOutputs.p4 ? `${cl.green}Ready${cl.reset}` : `${cl.dim}Empty${cl.reset}`}`);
+    console.log(`  - Pass 1 (Reify):     ${stageOutputs.p1 ? `${cl.green}Ready (${STAGE_FILENAMES.p1})${cl.reset}` : `${cl.dim}Unprocessed${cl.reset}`}`);
+    console.log(`  - Pass 2 (Seeds):     ${stageOutputs.p2 ? `${cl.green}Ready (${STAGE_FILENAMES.p2})${cl.reset}` : `${cl.dim}Unprocessed${cl.reset}`}`);
+    console.log(`  - Pass 3 (Audits):    ${stageOutputs.p3 ? `${cl.green}Ready (${STAGE_FILENAMES.p3})${cl.reset}` : `${cl.dim}Unprocessed${cl.reset}`}`);
+    console.log(`  - Pass 4 (Consolid):  ${stageOutputs.p4 ? `${cl.green}Ready (${STAGE_FILENAMES.p4})${cl.reset}` : `${cl.dim}Unprocessed${cl.reset}`}`);
     console.log(`${cl.bold}${cl.cyan}========================================================================${cl.reset}`);
 
     const choice = await rl.question(`${cl.bold}Select option: ${cl.reset}`);
@@ -177,14 +283,10 @@ async function main() {
     } else if (choice === "3") {
       await menuInteractiveWorkbench(rl);
     } else if (choice === "4") {
-      await menuExportResults(rl);
+      await menuInspectWorkspaceFiles(rl);
     } else if (choice === "5") {
-      inputText = DEFAULT_SAMPLE_TEXT;
-      stageOutputs.p1 = "";
-      stageOutputs.p2 = "";
-      stageOutputs.p3 = "";
-      stageOutputs.p4 = "";
-      await rl.question(`Workspace re-initialized. Press [Enter] to continue.`);
+      resetWorkspace();
+      await rl.question(`\nWorkspace files removed. State reset. Press [Enter] to continue.`);
     } else if (choice === "0") {
       break;
     }
@@ -213,18 +315,20 @@ async function menuViewEditSource(rl: readline.Interface) {
       lines.push(line);
     }
     inputText = lines.join("\n");
-    console.log(`\nSuccessfully loaded ${inputText.length} characters.`);
+    saveWorkspaceInput();
+    console.log(`\nSuccessfully loaded ${inputText.length} characters and saved to input.txt.`);
     await rl.question("Press [Enter] to return.");
   } else if (choice === "2") {
     inputText = DEFAULT_SAMPLE_TEXT;
-    console.log("\nReverted to default.");
+    saveWorkspaceInput();
+    console.log("\nReverted to default, written to input.txt.");
     await rl.question("Press [Enter] to return.");
   }
 }
 
 async function menuRunAutopilot(rl: readline.Interface) {
   clearScreen();
-  console.log(`${cl.bold}${cl.yellow}=== Autopilot Processing ===${cl.reset}\n`);
+  console.log(`${cl.bold}${cl.yellow}=== Autopilot Processing (Writing Directly to Files) ===${cl.reset}\n`);
   if (!inputText.trim()) {
     console.log(`${cl.red}Error: No input text provided.${cl.reset}`);
     await rl.question("\nPress [Enter] to abort.");
@@ -235,24 +339,28 @@ async function menuRunAutopilot(rl: readline.Interface) {
     console.log(`[1/4] Running Pass 1: Reify & Tag...`);
     const p1Raw = P1_PROMPT.replace("{{inputText}}", inputText);
     stageOutputs.p1 = await queryLLM(SYSTEM_INSTRUCTIONS, p1Raw);
-    console.log(`${cl.green}✔ Pass 1 Complete.${cl.reset}\n`);
+    saveWorkspaceStage("p1");
+    console.log(`${cl.green}✔ Pass 1 Complete and saved to ${STAGE_FILENAMES.p1}.${cl.reset}\n`);
 
     console.log(`[2/4] Running Pass 2: Seed Triples...`);
     const p2Raw = P2_PROMPT.replace("{{inputText}}", inputText).replace("{{p1Output}}", stageOutputs.p1);
     stageOutputs.p2 = await queryLLM(SYSTEM_INSTRUCTIONS, p2Raw);
-    console.log(`${cl.green}✔ Pass 2 Complete.${cl.reset}\n`);
+    saveWorkspaceStage("p2");
+    console.log(`${cl.green}✔ Pass 2 Complete and saved to ${STAGE_FILENAMES.p2}.${cl.reset}\n`);
 
     console.log(`[3/4] Running Pass 3: Class Audits...`);
     const p3Raw = P3_PROMPT.replace("{{inputText}}", inputText).replace("{{p1Output}}", stageOutputs.p1).replace("{{p2Output}}", stageOutputs.p2);
     stageOutputs.p3 = await queryLLM(SYSTEM_INSTRUCTIONS, p3Raw);
-    console.log(`${cl.green}✔ Pass 3 Complete.${cl.reset}\n`);
+    saveWorkspaceStage("p3");
+    console.log(`${cl.green}✔ Pass 3 Complete and saved to ${STAGE_FILENAMES.p3}.${cl.reset}\n`);
 
     console.log(`[4/4] Running Pass 4: Consolidation...`);
     const p4Raw = P4_PROMPT.replace("{{p1Output}}", stageOutputs.p1).replace("{{p2Output}}", stageOutputs.p2).replace("{{p3Output}}", stageOutputs.p3);
     stageOutputs.p4 = await queryLLM(SYSTEM_INSTRUCTIONS, p4Raw);
-    console.log(`${cl.green}✔ Pass 4 Complete.${cl.reset}\n`);
+    saveWorkspaceStage("p4");
+    console.log(`${cl.green}✔ Pass 4 Complete and saved to ${STAGE_FILENAMES.p4}.${cl.reset}\n`);
 
-    console.log(`${cl.bold}${cl.green}Autopilot successfully extracted all 4 stages!${cl.reset}`);
+    console.log(`${cl.bold}${cl.green}Autopilot successfully processed all stages and synchronized files!${cl.reset}`);
   } catch (err: any) {
     console.log(`\n${cl.red}Pipeline Error: ${err.message}${cl.reset}`);
   }
@@ -266,7 +374,7 @@ async function menuInteractiveWorkbench(rl: readline.Interface) {
   while (true) {
     clearScreen();
     console.log(`${cl.bold}${cl.yellow}=== Step-by-Step Interactive Workbench ===${cl.reset}`);
-    console.log(`Active Viewing: Stage ${cl.bold}${activeStage.toUpperCase()}${cl.reset}\n`);
+    console.log(`Active Viewing: Stage ${cl.bold}${activeStage.toUpperCase()}${cl.reset} (File-backed: ${STAGE_FILENAMES[activeStage]})\n`);
 
     console.log(`${cl.dim}--- Output Content ---${cl.reset}`);
     console.log(stageOutputs[activeStage] || `${cl.red}[No data extracted for this stage yet]${cl.reset}`);
@@ -329,7 +437,9 @@ async function runStageInteractive(rl: readline.Interface, stage: "p1" | "p2" | 
       stageOutputs[stage] = result;
     }
 
-    console.log(`${cl.green}✔ Process finished successfully.${cl.reset}`);
+    // Save update instantly to disk
+    saveWorkspaceStage(stage);
+    console.log(`${cl.green}✔ Process finished. Output written to ${STAGE_FILENAMES[stage]}.${cl.reset}`);
   } catch (err: any) {
     console.log(`${cl.red}Error: ${err.message}${cl.reset}`);
   }
@@ -345,39 +455,29 @@ async function manualEditStage(rl: readline.Interface, stage: "p1" | "p2" | "p3"
     lines.push(line);
   }
   stageOutputs[stage] = lines.join("\n");
-  console.log(`\n${cl.green}Stage local changes saved.${cl.reset}`);
+  
+  // Save update instantly to disk
+  saveWorkspaceStage(stage);
+  console.log(`\n${cl.green}Stage changes written to disk (${STAGE_FILENAMES[stage]}).${cl.reset}`);
   await rl.question("\nPress [Enter] to continue.");
 }
 
-async function menuExportResults(rl: readline.Interface) {
+async function menuInspectWorkspaceFiles(rl: readline.Interface) {
   clearScreen();
-  console.log(`${cl.bold}${cl.yellow}=== Export Data Options ===${cl.reset}\n`);
-  console.log("  [1] Save Consolidate Markdown (Stage 4) to file");
-  console.log("  [2] Convert Stage 4 Markdown to CSV");
-  console.log("  [0] Back");
+  console.log(`${cl.bold}${cl.yellow}=== Inspecting Workspace Folder ===${cl.reset}`);
+  console.log(`Directory: ${WORKSPACE_DIR}\n`);
 
-  const choice = await rl.question(`\nSelect action: `);
-  if (choice === "1") {
-    if (!stageOutputs.p4) {
-      console.log(`${cl.red}Error: Stage 4 has not been generated yet.${cl.reset}`);
-    } else {
-      const filepath = path.join(process.cwd(), `Chronos_Stage_P4_Extract_${Date.now()}.md`);
-      fs.writeFileSync(filepath, stageOutputs.p4, "utf-8");
-      console.log(`\n${cl.green}Markdown output written to:${cl.reset}\n${filepath}`);
+  const files = fs.readdirSync(WORKSPACE_DIR);
+  if (files.length === 0) {
+    console.log("No files are currently stored in the workspace.");
+  } else {
+    for (const file of files) {
+      const stats = fs.statSync(path.join(WORKSPACE_DIR, file));
+      console.log(`  - ${cl.bold}${file}${cl.reset} (${stats.size} bytes, modified: ${stats.mtime.toLocaleTimeString()})`);
     }
-    await rl.question("\nPress [Enter] to return.");
-  } else if (choice === "2") {
-    const activeText = stageOutputs.p4 || stageOutputs.p3 || stageOutputs.p2;
-    if (!activeText) {
-      console.log(`${cl.red}Error: No tabular outputs found to parse.${cl.reset}`);
-    } else {
-      const csvContent = translateToCSV(activeText);
-      const filepath = path.join(process.cwd(), `KnowledgeGraph_${Date.now()}.csv`);
-      fs.writeFileSync(filepath, csvContent, "utf-8");
-      console.log(`\n${cl.green}CSV File compiled successfully to:${cl.reset}\n${filepath}`);
-    }
-    await rl.question("\nPress [Enter] to return.");
   }
+
+  await rl.question(`\nPress [Enter] to return.`);
 }
 
 main().catch(console.error);
